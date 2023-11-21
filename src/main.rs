@@ -50,15 +50,16 @@ enum LexerErrorKind {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("Encountered error:\n{error_kind}\n at {line}:{col} while processing token \"{token}\"")]
+#[error("{filename}:{line}:{col}\nSyntax error:\n\t{snippet}\n\t{error_kind}")]
 struct LexerError<'a> {
     error_kind: LexerErrorKind,
     line: usize,
     col: usize,
-    token: &'a str,
+    filename: &'a str,
+    snippet: &'a str,
 }
 
-fn make_token(lexeme: &str, line: usize, col: usize) -> Result<Token, LexerError> {
+fn make_token<'a>(lexeme: &'a str, line: usize, col: usize) -> Result<Token<'a>, LexerErrorKind> {
     let col = col - (lexeme.len() - 1);
     match lexeme {
         "let" => Ok(Token {
@@ -110,12 +111,7 @@ fn make_token(lexeme: &str, line: usize, col: usize) -> Result<Token, LexerError
                         kind: TokenKind::IntegerLiteral(parsed_int),
                     })
                 } else {
-                    Err(LexerError {
-                        line,
-                        col,
-                        token: lexeme,
-                        error_kind: LexerErrorKind::InvalidToken,
-                    })
+                    Err(LexerErrorKind::InvalidToken)
                 }
             } else if let Some(stripped) = lexeme.strip_prefix("0b") {
                 if let Ok(parsed_int) = i64::from_str_radix(stripped, 2) {
@@ -125,13 +121,14 @@ fn make_token(lexeme: &str, line: usize, col: usize) -> Result<Token, LexerError
                         kind: TokenKind::IntegerLiteral(parsed_int),
                     })
                 } else {
-                    Err(LexerError {
-                        line,
-                        col,
-                        token: lexeme,
-                        error_kind: LexerErrorKind::InvalidToken,
-                    })
+                    Err(LexerErrorKind::InvalidToken)
                 }
+            } else if let Ok(parsed) = lexeme.parse::<i64>() {
+                Ok(Token {
+                    line,
+                    col,
+                    kind: TokenKind::IntegerLiteral(parsed),
+                })
             } else if let Ok(parsed_float) = lexeme.parse::<f64>() {
                 Ok(Token {
                     line,
@@ -147,69 +144,62 @@ fn make_token(lexeme: &str, line: usize, col: usize) -> Result<Token, LexerError
                         kind: TokenKind::Identifier(lexeme),
                     })
                 } else {
-                    Err(LexerError {
-                        line,
-                        col,
-                        error_kind: LexerErrorKind::InvalidToken,
-                        token: lexeme,
-                    })
+                    Err(LexerErrorKind::InvalidToken)
                 }
             }
         }
     }
 }
 
-fn tokenize(code: &str) -> Result<Vec<Token>, LexerError> {
+fn tokenize<'a>(code: &'a str, filename: &'a str) -> Result<Vec<Token<'a>>, LexerError<'a>> {
     let mut tokens = vec![];
-    let mut iter = code.as_bytes().iter().enumerate();
+    let mut iter = code.as_bytes().iter().enumerate().peekable();
     let (mut line, mut col) = (1, 1);
     let mut start = 0;
-    while let Some((idx, chr)) = iter.next() {
-        let scanned_token = match chr {
+    let mut i = 0;
+    while let Some((idx, scanned)) = iter.next() {
+        i = idx;
+        let scanned_token = match scanned {
             b' ' | b'\t' => {
                 col += 1;
+                start = idx + 1;
                 continue;
             }
             b'\n' => {
                 col = 1;
                 line += 1;
+                start = idx + 1;
                 continue;
             }
-            b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'0'..=b'9' => {
-                if let Some(next) = code.as_bytes().get(idx + 1) {
-                    match next {
-                        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' => {
-                            col += 1;
-                            continue;
-                        }
-                        _ => {
-                            make_token(&code[start..idx+1], line, col)
-                        }
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'0'..=b'9' | b'.' => match iter.peek() {
+                Some((next_idx, lookahead)) => match lookahead {
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.' => {
+                        col += 1;
+                        continue;
                     }
-                } else {
-                    make_token(&code[start..idx], line, col)
-                }
-            }
-
+                    _ => make_token(&code[start..*next_idx], line, col),
+                },
+                None => make_token(&code[start..idx], line, col),
+            },
             b',' => Ok(Token {
                 kind: TokenKind::Comma,
                 line,
-                col: col + 1,
+                col,
             }),
             b':' => Ok(Token {
                 kind: TokenKind::Colon,
                 line,
-                col: col + 1,
+                col,
             }),
             b'=' => Ok(Token {
                 kind: TokenKind::Equals,
                 line,
-                col: col + 1,
+                col,
             }),
             b';' => Ok(Token {
                 kind: TokenKind::SemiColon,
                 line,
-                col: col + 1,
+                col,
             }),
             b'|' => Ok(Token {
                 kind: TokenKind::Or,
@@ -251,36 +241,43 @@ fn tokenize(code: &str) -> Result<Vec<Token>, LexerError> {
                 line,
                 col,
             }),
-            b'"' => loop {
+            b'"' | b'\'' => loop {
+                // TODO: escape sequence
                 if let Some((x, chr)) = iter.next() {
-                    if *chr == b'"' {
+                    col += 1;
+                    i += 1;
+                    if chr == scanned {
+                        let lexeme = &code[start + 1..x];
+                        let len = lexeme.len() + 1;
                         break Ok(Token {
-                            kind: TokenKind::StringLiteral(&code[start..x]),
+                            kind: TokenKind::StringLiteral(lexeme),
                             line,
-                            col,
+                            col: col - len,
                         });
                     }
                 } else {
-                    break Err(LexerError {
-                        line,
-                        col,
-                        error_kind: LexerErrorKind::UnexpectedEof("\"".to_owned()),
-                        token: &code[idx..],
-                    });
+                    break Err(LexerErrorKind::UnexpectedEof(format!(
+                        "a '{}'",
+                        *scanned as char
+                    )));
                 }
             },
-            _ => Err(LexerError {
-                error_kind: LexerErrorKind::UnexpectedCharacter(*chr as char),
-                line,
-                col,
-                token: &code[idx..idx + 1],
-            }),
+            _ => Err(LexerErrorKind::UnexpectedCharacter(*scanned as char)),
         };
-        if let Ok(token) = scanned_token {
-            tokens.push(token);
-            start = idx;
-            col += 1;
-        }
+        match scanned_token {
+            Ok(token) => tokens.push(token),
+            Err(error_kind) => {
+                return Err(LexerError {
+                    error_kind,
+                    line,
+                    col,
+                    filename,
+                    snippet: &code[i - col + 1..=i],
+                })
+            }
+        };
+        start = idx;
+        col += 1;
     }
     Ok(tokens)
 }
@@ -289,7 +286,7 @@ fn main() -> std::io::Result<()> {
     let mut file = std::fs::File::open("test.jasm")?;
     let mut buf = String::new();
     file.read_to_string(&mut buf)?;
-    match tokenize(&buf) {
+    match tokenize(&buf, "test.jasm") {
         Ok(tokens) => {
             println!("{:?}", tokens);
         }
